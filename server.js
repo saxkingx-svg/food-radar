@@ -2,227 +2,105 @@ const express = require("express");
 const cors = require("cors");
 
 const app = express();
+
 const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
-app.use(express.static(__dirname));
+app.use(express.json());
 
 /*
   FOOD RADAR
-  店家資料服務備援
+  附近美食搜尋後端
+
+  重要：
+  不再一個 API 一個 API 慢慢等。
+  多個 Overpass 同時查詢，第一個成功的直接使用。
 */
+
 const OVERPASS_SERVERS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
-  "https://overpass.private.coffee/api/interpreter",
-  "https://overpass.nchc.org.tw/api/interpreter"
+  "https://overpass.maprva.org/api/interpreter"
 ];
 
-/*
-  分類
-*/
-const CATEGORY_FILTERS = {
-  all: `
-    nwr[
-      "amenity"~"restaurant|cafe|fast_food|food_court|ice_cream|bar|pub|biergarten|bakery|confectionery"
-    ]
-  `,
+const CATEGORY_RULES = {
+  all: null,
 
   restaurant: `
-    nwr["amenity"="restaurant"]
+    ["amenity"="restaurant"]
   `,
 
   cafe: `
-    nwr["amenity"="cafe"]
+    ["amenity"="cafe"]
   `,
 
   fastfood: `
-    nwr["amenity"="fast_food"]
+    ["amenity"="fast_food"]
   `,
 
   japanese: `
-    nwr["cuisine"~"japanese|sushi",i]
+    ["amenity"="restaurant"]["cuisine"~"japanese|sushi|ramen|udon|tempura",i]
   `,
 
   bbq: `
-    nwr["cuisine"~"barbecue|bbq|korean",i]
+    ["amenity"="restaurant"]["cuisine"~"barbecue|bbq|korean",i]
   `,
 
   hotpot: `
-    nwr["cuisine"~"hot_pot|hotpot",i]
+    ["amenity"="restaurant"]["cuisine"~"hotpot|shabu|steamboat",i]
   `,
 
   dessert: `
-    nwr["amenity"~"ice_cream|bakery|confectionery"]
+    (
+      ["amenity"="cafe"]
+      ["shop"="bakery"]
+      ["shop"="confectionery"]
+    )
   `,
 
   night: `
-    nwr[
-      "amenity"~"restaurant|fast_food|cafe|bar|pub"
-    ]
+    ["amenity"~"restaurant|fast_food|cafe|bar",i]
   `
 };
 
-/*
-  清理文字
-*/
-function clean(value) {
-  return String(value || "")
-    .replace(/[<>&"]/g, "");
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-/*
-  避免搜尋關鍵字破壞 Overpass Regex
-*/
-function escapeRegex(value) {
-  return String(value || "")
-    .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    .slice(0, 50);
+function distanceKm(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) *
+    Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLng / 2) ** 2;
+
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-/*
-  建立搜尋 Query
-*/
-function buildQuery(lat, lng, category, keyword) {
-  const filter =
-    CATEGORY_FILTERS[category] ||
-    CATEGORY_FILTERS.all;
-
-  const keywordPart = keyword
-    ? `["name"~"${escapeRegex(keyword)}",i]`
-    : "";
-
-  return `
-[out:json][timeout:45];
-
-(
-  ${filter}${keywordPart}(around:5000,${lat},${lng});
-);
-
-out center tags;
-`;
+function escapeRegex(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/*
-  嘗試所有 Overpass 服務
-*/
-async function fetchOverpass(query) {
-  let lastError = null;
+function getCategory(tags = {}) {
+  const amenity = String(tags.amenity || "").toLowerCase();
+  const shop = String(tags.shop || "").toLowerCase();
+  const cuisine = String(tags.cuisine || "").toLowerCase();
+  const name = String(tags.name || "").toLowerCase();
 
-  for (const server of OVERPASS_SERVERS) {
-    let controller;
-    let timeout;
-
-    try {
-      console.log("");
-      console.log("================================");
-      console.log("嘗試店家資料服務");
-      console.log(server);
-      console.log("================================");
-
-      controller = new AbortController();
-
-      timeout = setTimeout(() => {
-        controller.abort();
-      }, 50000);
-
-      const response = await fetch(server, {
-        method: "POST",
-
-        headers: {
-          "Content-Type":
-            "application/x-www-form-urlencoded",
-
-          "User-Agent":
-            "FOOD-RADAR/2.0 (+https://food-radar-6vbo.onrender.com)"
-        },
-
-        body:
-          "data=" +
-          encodeURIComponent(query),
-
-        signal: controller.signal
-      });
-
-      clearTimeout(timeout);
-
-      if (!response.ok) {
-        throw new Error(
-          `資料服務 HTTP ${response.status}`
-        );
-      }
-
-      const text =
-        await response.text();
-
-      if (!text) {
-        throw new Error(
-          "資料服務沒有回傳內容"
-        );
-      }
-
-      let data;
-
-      try {
-        data = JSON.parse(text);
-      } catch {
-        throw new Error(
-          "資料服務回傳格式錯誤"
-        );
-      }
-
-      if (
-        !data ||
-        !Array.isArray(data.elements)
-      ) {
-        throw new Error(
-          "資料服務沒有有效店家資料"
-        );
-      }
-
-      console.log(
-        `資料服務成功：${server}`
-      );
-
-      return data;
-
-    } catch (error) {
-      lastError = error;
-
-      console.log(
-        `資料服務失敗：${server}`
-      );
-
-      console.log(
-        error?.message || error
-      );
-
-    } finally {
-      if (timeout) {
-        clearTimeout(timeout);
-      }
-    }
+  if (
+    shop === "bakery" ||
+    shop === "confectionery" ||
+    /dessert|cake|甜點|蛋糕|麵包/.test(name)
+  ) {
+    return "dessert";
   }
-
-  throw (
-    lastError ||
-    new Error(
-      "所有店家資料服務都無法使用"
-    )
-  );
-}
-
-/*
-  判斷店家分類
-*/
-function getCategory(tags) {
-  const amenity =
-    String(tags.amenity || "");
-
-  const cuisine =
-    String(tags.cuisine || "");
 
   if (amenity === "cafe") {
     return "cafe";
@@ -233,33 +111,38 @@ function getCategory(tags) {
   }
 
   if (
-    /japanese|sushi/i.test(cuisine)
+    /japanese|sushi|ramen|udon|tempura|japan/.test(cuisine) ||
+    /日式|日本|壽司|拉麵|烏龍/.test(name)
   ) {
     return "japanese";
   }
 
   if (
-    /barbecue|bbq|korean/i.test(cuisine)
+    /barbecue|bbq|korean/.test(cuisine) ||
+    /燒肉|烤肉|韓式/.test(name)
   ) {
     return "bbq";
   }
 
   if (
-    /hot_pot|hotpot/i.test(cuisine)
+    /hotpot|shabu|steamboat/.test(cuisine) ||
+    /火鍋|涮涮鍋|麻辣鍋/.test(name)
   ) {
     return "hotpot";
   }
 
   if (
-    /ice_cream|bakery|confectionery/i.test(
-      amenity
-    )
+    amenity === "restaurant" ||
+    amenity === "food_court" ||
+    amenity === "biergarten"
   ) {
-    return "dessert";
+    return "restaurant";
   }
 
   if (
-    /bar|pub/i.test(amenity)
+    amenity === "bar" ||
+    amenity === "pub" ||
+    amenity === "nightclub"
   ) {
     return "night";
   }
@@ -267,391 +150,358 @@ function getCategory(tags) {
   return "restaurant";
 }
 
-/*
-  計算距離
-*/
-function calculateDistance(
-  userLat,
-  userLng,
-  lat,
-  lng
-) {
-  const dLat =
-    (lat - userLat) * 111;
-
-  const dLng =
-    (lng - userLng) *
-    111 *
-    Math.cos(
-      userLat *
-        Math.PI /
-        180
-    );
-
-  return Math.sqrt(
-    dLat * dLat +
-    dLng * dLng
-  );
-}
-
-/*
-  OSM 資料 → FOOD RADAR 店家格式
-*/
-function normalizePlace(
-  element,
-  userLat,
-  userLng
-) {
-  const tags =
-    element.tags || {};
-
-  const lat =
-    element.lat ??
-    element.center?.lat;
-
-  const lng =
-    element.lon ??
-    element.center?.lon;
-
-  if (
-    !Number.isFinite(Number(lat)) ||
-    !Number.isFinite(Number(lng)) ||
-    !tags.name
-  ) {
-    return null;
+function getCenter(element) {
+  if (element.lat != null && element.lon != null) {
+    return {
+      lat: Number(element.lat),
+      lng: Number(element.lon)
+    };
   }
 
-  const address = [
+  if (
+    element.center &&
+    element.center.lat != null &&
+    element.center.lon != null
+  ) {
+    return {
+      lat: Number(element.center.lat),
+      lng: Number(element.center.lon)
+    };
+  }
+
+  return null;
+}
+
+function normalize(element, userLat, userLng) {
+  const tags = element.tags || {};
+  const center = getCenter(element);
+
+  if (!center) return null;
+
+  const name =
+    tags.name ||
+    tags["name:zh"] ||
+    tags["name:zh-Hant"] ||
+    tags["name:en"];
+
+  if (!name) return null;
+
+  const distance = distanceKm(
+    userLat,
+    userLng,
+    center.lat,
+    center.lng
+  );
+
+  const addressParts = [
+    tags["addr:postcode"],
     tags["addr:city"],
     tags["addr:district"],
-    tags["addr:town"],
-    tags["addr:village"],
     tags["addr:suburb"],
     tags["addr:street"],
     tags["addr:housenumber"]
-  ]
-    .filter(Boolean)
-    .join("");
+  ].filter(Boolean);
 
-  const distance =
-    calculateDistance(
-      userLat,
-      userLng,
-      Number(lat),
-      Number(lng)
-    );
+  const address =
+    addressParts.join("") ||
+    tags["addr:full"] ||
+    tags["contact:address"] ||
+    "";
 
-  const cuisine =
-    tags.cuisine
-      ? String(tags.cuisine)
-          .split(";")
-          .slice(0, 3)
-          .join("、")
-      : "";
+  const category = getCategory(tags);
 
   return {
-    id:
-      `${element.type}-${element.id}`,
-
-    name:
-      clean(tags.name),
-
-    lat:
-      Number(lat),
-
-    lng:
-      Number(lng),
-
-    address:
-      clean(address),
-
+    id: `${element.type}-${element.id}`,
+    name,
+    lat: center.lat,
+    lng: center.lng,
+    distanceKm: Number(distance.toFixed(2)),
+    category,
+    cuisine: tags.cuisine || "",
+    address,
     phone:
-      clean(
-        tags.phone ||
-        tags["contact:phone"]
-      ),
-
-    website:
-      clean(
-        tags.website ||
-        tags["contact:website"]
-      ),
-
-    cuisine:
-      clean(cuisine),
-
+      tags.phone ||
+      tags["contact:phone"] ||
+      "",
     openingHours:
-      clean(
-        tags.opening_hours
-      ),
-
-    takeaway:
-      clean(
-        tags.takeaway
-      ),
-
-    wheelchair:
-      clean(
-        tags.wheelchair
-      ),
-
-    category:
-      getCategory(tags),
-
-    distanceKm:
-      Number(
-        distance.toFixed(2)
-      )
+      tags.opening_hours ||
+      "",
+    website:
+      tags.website ||
+      tags["contact:website"] ||
+      "",
+    source: "OpenStreetMap"
   };
+}
+
+/*
+  建立查詢
+  搜尋 5 公里內的餐飲相關店家。
+*/
+
+function buildQuery(lat, lng, category) {
+  const rule = CATEGORY_RULES[category] || CATEGORY_RULES.all;
+
+  let selector;
+
+  if (category === "all") {
+    selector = `
+      (
+        nwr(around:5000,${lat},${lng})["amenity"~"restaurant|cafe|fast_food|food_court|bar|pub|biergarten|nightclub"];
+        nwr(around:5000,${lat},${lng})["shop"~"bakery|confectionery"];
+      );
+    `;
+  } else if (category === "dessert") {
+    selector = `
+      (
+        nwr(around:5000,${lat},${lng})["amenity"="cafe"];
+        nwr(around:5000,${lat},${lng})["shop"="bakery"];
+        nwr(around:5000,${lat},${lng})["shop"="confectionery"];
+      );
+    `;
+  } else {
+    selector = `
+      nwr(around:5000,${lat},${lng})${rule};
+    `;
+  }
+
+  return `
+    [out:json][timeout:10];
+    ${selector}
+    out center tags;
+  `;
+}
+
+/*
+  單一 Overpass 查詢
+  最多等待 12 秒。
+*/
+
+async function queryServer(url, query) {
+  const controller = new AbortController();
+
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, 12000);
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "FOOD-RADAR/2.0"
+      },
+      body: "data=" + encodeURIComponent(query),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (!data || !Array.isArray(data.elements)) {
+      throw new Error("API 回傳資料格式錯誤");
+    }
+
+    return data.elements;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/*
+  多個服務「同時」查詢。
+  第一個成功就回傳，不再浪費時間等待其他服務。
+*/
+
+async function queryOverpass(query) {
+  const jobs = OVERPASS_SERVERS.map((server) => {
+    return queryServer(server, query);
+  });
+
+  try {
+    return await Promise.any(jobs);
+  } catch (error) {
+    throw new Error("附近店家資料服務目前無法連線");
+  }
 }
 
 /*
   健康檢查
 */
-app.get(
-  "/api/health",
-  (req, res) => {
-    res.json({
-      ok: true,
-      service: "FOOD RADAR",
-      status: "online",
-      time:
-        new Date().toISOString()
-    });
-  }
-);
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "FOOD RADAR",
+    status: "online",
+    time: new Date().toISOString()
+  });
+});
 
 /*
   附近店家
 */
-app.get(
-  "/api/nearby",
-  async (req, res) => {
-    try {
-      const lat =
-        Number(req.query.lat);
 
-      const lng =
-        Number(req.query.lng);
+app.get("/api/nearby", async (req, res) => {
+  const lat = num(req.query.lat);
+  const lng = num(req.query.lng);
 
-      const category =
-        String(
-          req.query.category ||
-          "all"
+  const category =
+    String(req.query.category || "all").toLowerCase();
+
+  const keyword =
+    String(req.query.q || "").trim().toLowerCase();
+
+  if (lat === null || lng === null) {
+    return res.status(400).json({
+      success: false,
+      message: "定位資料無效"
+    });
+  }
+
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    return res.status(400).json({
+      success: false,
+      message: "定位座標無效"
+    });
+  }
+
+  const allowedCategories = Object.keys(CATEGORY_RULES);
+
+  const safeCategory = allowedCategories.includes(category)
+    ? category
+    : "all";
+
+  console.log(
+    `[NEARBY] ${lat}, ${lng} category=${safeCategory} q=${keyword}`
+  );
+
+  try {
+    const query = buildQuery(
+      lat,
+      lng,
+      safeCategory
+    );
+
+    const elements = await queryOverpass(query);
+
+    let places = elements
+      .map((element) =>
+        normalize(element, lat, lng)
+      )
+      .filter(Boolean);
+
+    /*
+      關鍵字搜尋
+    */
+
+    if (keyword) {
+      const re = new RegExp(
+        escapeRegex(keyword),
+        "i"
+      );
+
+      places = places.filter((p) => {
+        return (
+          re.test(p.name) ||
+          re.test(p.cuisine) ||
+          re.test(p.address)
         );
-
-      const keyword =
-        String(
-          req.query.q || ""
-        ).trim();
-
-      /*
-        檢查座標
-      */
-      if (
-        !Number.isFinite(lat) ||
-        !Number.isFinite(lng)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "定位座標無效"
-        });
-      }
-
-      if (
-        lat < -90 ||
-        lat > 90 ||
-        lng < -180 ||
-        lng > 180
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "定位座標超出範圍"
-        });
-      }
-
-      /*
-        防止亂傳分類
-      */
-      const validCategories =
-        Object.keys(
-          CATEGORY_FILTERS
-        );
-
-      const safeCategory =
-        validCategories.includes(
-          category
-        )
-          ? category
-          : "all";
-
-      console.log("");
-      console.log(
-        "========== 新搜尋 =========="
-      );
-
-      console.log(
-        `位置：${lat}, ${lng}`
-      );
-
-      console.log(
-        `分類：${safeCategory}`
-      );
-
-      console.log(
-        `關鍵字：${keyword || "無"}`
-      );
-
-      /*
-        建立 Query
-      */
-      const query =
-        buildQuery(
-          lat,
-          lng,
-          safeCategory,
-          keyword
-        );
-
-      /*
-        取得資料
-      */
-      const data =
-        await fetchOverpass(
-          query
-        );
-
-      /*
-        去除重複
-      */
-      const seen =
-        new Set();
-
-      const places =
-        (data.elements || [])
-          .map(
-            element =>
-              normalizePlace(
-                element,
-                lat,
-                lng
-              )
-          )
-
-          .filter(Boolean)
-
-          .filter(place => {
-            const key =
-              `${place.name}-${place.lat.toFixed(5)}-${place.lng.toFixed(5)}`;
-
-            if (
-              seen.has(key)
-            ) {
-              return false;
-            }
-
-            seen.add(key);
-
-            return true;
-          })
-
-          .sort(
-            (a, b) =>
-              a.distanceKm -
-              b.distanceKm
-          )
-
-          .slice(0, 100);
-
-      console.log(
-        `成功找到 ${places.length} 間店家`
-      );
-
-      return res.json({
-        success: true,
-        count:
-          places.length,
-        places
-      });
-
-    } catch (error) {
-      console.error("");
-      console.error(
-        "========== 搜尋失敗 =========="
-      );
-
-      console.error(
-        error?.message ||
-        error
-      );
-
-      return res.status(502).json({
-        success: false,
-
-        message:
-          "附近美食資料服務暫時無法連線，請稍後再試。",
-
-        detail:
-          process.env.NODE_ENV ===
-          "development"
-            ? error?.message
-            : undefined
       });
     }
+
+    /*
+      分類再次過濾。
+      避免不同 OSM 標籤造成分類跑掉。
+    */
+
+    if (safeCategory !== "all") {
+      places = places.filter(
+        (p) => p.category === safeCategory
+      );
+    }
+
+    /*
+      距離排序
+    */
+
+    places.sort(
+      (a, b) =>
+        a.distanceKm - b.distanceKm
+    );
+
+    /*
+      去除同名、同座標重複資料
+    */
+
+    const seen = new Set();
+
+    places = places.filter((p) => {
+      const key =
+        `${p.name}-${p.lat.toFixed(5)}-${p.lng.toFixed(5)}`;
+
+      if (seen.has(key)) {
+        return false;
+      }
+
+      seen.add(key);
+      return true;
+    });
+
+    /*
+      最多回傳 100 間
+    */
+
+    places = places.slice(0, 100);
+
+    console.log(
+      `[NEARBY] success: ${places.length} places`
+    );
+
+    return res.json({
+      success: true,
+      count: places.length,
+      places
+    });
+
+  } catch (error) {
+    console.error(
+      "[NEARBY ERROR]",
+      error.message
+    );
+
+    return res.status(502).json({
+      success: false,
+      message:
+        "附近店家資料服務暫時忙碌，請稍後再試"
+    });
   }
-);
+});
 
 /*
-  網站首頁
+  靜態網站
 */
-app.get(
-  "*",
-  (req, res) => {
-    res.sendFile(
-      __dirname +
-      "/index.html"
-    );
-  }
-);
+
+app.use(express.static(__dirname));
+
+app.get("*", (req, res) => {
+  res.sendFile(
+    require("path").join(
+      __dirname,
+      "index.html"
+    )
+  );
+});
 
 /*
   啟動
 */
-app.listen(
-  PORT,
-  HOST,
-  () => {
-    console.log("");
-    console.log(
-      "================================"
-    );
 
-    console.log(
-      "        FOOD RADAR ONLINE"
-    );
-
-    console.log(
-      "================================"
-    );
-
-    console.log(
-      `Port: ${PORT}`
-    );
-
-    console.log(
-      `Local: http://localhost:${PORT}`
-    );
-
-    console.log(
-      `Host: ${HOST}`
-    );
-
-    console.log(
-      "================================"
-    );
-
-    console.log("");
-  }
-);
+app.listen(PORT, HOST, () => {
+  console.log(
+    `FOOD RADAR running on ${HOST}:${PORT}`
+  );
+});
